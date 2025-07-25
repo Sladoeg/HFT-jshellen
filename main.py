@@ -56,20 +56,20 @@ def create_as2p_model_solutions():
 
 def create_as3p_model_solutions():
     
-    lambda_m = 50
-    lambda_p = 50
+    lambda_m = 100
+    lambda_p = 60
     kappa_m = 100
     kappa_p = 100
     delta = 0
-    epsilon_m = 0
-    epsilon_p = 0
-    phi = 0.000001
-    alpha = 0.0001
-    q_min = -5
-    q_max = 5
-    cost = 0.005
-    rebate = 0.0025
-    tick = 0.5
+    epsilon_m = 0.007
+    epsilon_p = 0.007
+    phi = 0.001
+    alpha = 0.000000
+    q_min = -10
+    q_max = 10
+    cost = 0.007*3
+    rebate = 0
+    tick = 0.0005
     T = 5  # minutes
     n = 5*60  # one step per second
 
@@ -116,7 +116,7 @@ def create_as3p_model_solutions():
     
     # Plot the ask spread for continuation region
     f, ax = pp.subplots(figsize=[5, 4])
-    for q in range(3, -4, -1):
+    for q in range(q_max-1, q_min, -1):
         ax.plot(model.l_p[q], label=f'q={q}')
     ax.set_title("Ask to mid spread")
     pp.legend()
@@ -124,7 +124,7 @@ def create_as3p_model_solutions():
 
     # Plot the bid spread for continuation region
     fig, ax = pp.subplots(figsize=[5, 4])
-    for q in range(3, -4, -1):
+    for q in range(q_max-1, q_min, -1):
         ax.plot(model.l_m[q], label=f'q={q}')
     ax.set_title("Bid to mid spread")
     pp.legend()
@@ -135,22 +135,22 @@ def create_as3p_model_solutions():
 
 def create_asas_model_solutions():
 
-    lambda_m = 40
-    lambda_p = 40
-    kappa_m = 1.0/10
-    kappa_p = 1.0/10
-    epsilon_m = 30
-    epsilon_p = 30
+    lambda_m = 50
+    lambda_p = 80
+    kappa_m = 80
+    kappa_p = 50
+    epsilon_m = 0.007
+    epsilon_p = 0.007
     delta = 0
-    phi = 0.01
-    alpha = 0.01
+    phi = 0.0000001
+    alpha = 0.00001
     q_min = -6
     q_max = 6
-    cost = 0.000
-    rebate = 0.0025
-    tick = 0.5
-    T = 10  # minutes
-    n = 500  # one step per second
+    cost = 0.007*3
+    rebate = 0.000
+    tick = 0.005
+    T = 60  # minutes
+    n = 60*60  # one step per second
 
     parameters = MM_Model_Parameters(lambda_m, lambda_p, kappa_m, kappa_p, delta, epsilon_m, epsilon_p,
                                      phi, alpha, q_min, q_max, T, cost, rebate, tick)
@@ -179,8 +179,8 @@ def create_asas_model_solutions():
 
 if __name__ == '__main__':
     #create_as2p_model_solutions()
-    #create_as3p_model_solutions()
-    create_asas_model_solutions()
+    create_as3p_model_solutions()
+    #create_asas_model_solutions()
 
 
 
