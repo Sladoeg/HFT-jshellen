@@ -12,15 +12,14 @@ import aiohttp
 
 import numpy as np
 import ccxt.pro as ccxtpro
-from numba.cuda.libdevice import sqrtf
 
 # ---------------------------
 # CONFIGURATION
 # ---------------------------
 EXCHANGE_ID = "aster"
 SYMBOL = "ETHUSDT"
-API_KEY = "3b41cf2fc679092b31a9032b1b57149d7faf9c7d228ff36333add8d678112616"
-API_SECRET = "8756a22bbebf97225b9cc2c9bec7d329ab178646d216e4e7f91107275673becd"
+API_KEY = ""
+API_SECRET = ""
 
 FALLBACK_TICK_SIZE = 0.1
 FALLBACK_LOT_SIZE = 0.001
@@ -36,12 +35,34 @@ MAX_POSITION_BASE = 0.003 * 25
 ORDER_QTY_BASE = 0.003
 GRID_NUM = 10
 HALF_SPREAD_COEFF = 1
-SKEW_COEFF = 0.05
+SKEW_COEFF = 0.03
 MAX_NORM_POS = 25.0
 
 # GLFT parameters
-GLFT_GAMMA = 0.05
-GLFT_VOL_WINDOW = 6000
+GLFT_GAMMA = 0.15
+
+# ---------------------------
+# TIMING & WINDOWING CONFIG (0.1 SECOND SAMPLING)
+# ---------------------------
+
+# Arrival depth calculation (0.1 second sampling)
+ARRIVAL_DEPTH_WINDOW_SIZE_SEC = 0.1  # 100ms window for max depth aggregation
+ARRIVAL_DEPTH_BUFFER_SIZE = 3000  # 60,000 samples × 0.1s = 6000 seconds (10 minutes)
+WARMUP_MIN_ARRIVAL_DEPTHS = 100  # 600 samples × 0.1s = 60 seconds minimum
+
+# Volatility calculation (0.1 second sampling → 1 second volatility)
+MID_PRICE_WINDOW_SIZE_SEC = 0.1  # 100ms window for mid-price aggregation
+GLFT_VOL_WINDOW = 3000  # 3000 samples × 0.1s = 300 seconds (5 minutes)
+VOLATILITY_SCALING_FACTOR = math.sqrt(10)  # Scale from 0.1-sec to 1-sec: √(1.0 / 0.1) = √10
+
+# K parameter estimation (uses 0.1 second arrival depth samples)
+K_ESTIMATION_MAX_WINDOW_SEC = 3000.0  # Cap observation window at 10 minutes
+K_ESTIMATION_MIN_SAMPLES = 100  # 600 samples × 0.1s = 60 seconds minimum
+K_ESTIMATION_UPDATE_INTERVAL = 50  # Update k every N computation cycles
+
+# ---------------------------
+# GLFT PARAMETERS
+# ---------------------------
 
 # Dynamic GLFT_DELTA parameters
 GLFT_DELTA_MIN = 1
@@ -50,11 +71,7 @@ GLFT_DELTA_MAX = 1
 
 # WARMUP PARAMETERS
 WARMUP_TIMEOUT_SEC = 30.0
-WARMUP_MIN_ARRIVAL_DEPTHS = 20
 MIN_VALID_K = 1e-6
-
-# 1-SECOND WINDOWING
-ARRIVAL_DEPTH_WINDOW_SIZE_SEC = 0.1
 
 # BACKGROUND GLFT COMPUTATION
 ENABLE_BACKGROUND_GLFT = True
@@ -72,8 +89,8 @@ WEBSOCKET_HEALTH_CHECK_INTERVAL_SEC = 5.0  # Check connection health every 5s
 # BATCH ORDER SETTINGS
 ENABLE_NATIVE_BATCH = True
 BATCH_MAX_CONCURRENT = 5
-BATCH_PLACE_TIMEOUT_SEC = 10.0
-BATCH_CANCEL_TIMEOUT_SEC = 10.0
+BATCH_PLACE_TIMEOUT_SEC = 5.0
+BATCH_CANCEL_TIMEOUT_SEC = 5.0
 CANCEL_TO_PLACE_DELAY_SEC = 0.0  # Delay between cancel and place operations
 
 # Arrival depth measurement (REQUIRED for k estimation)
@@ -81,21 +98,21 @@ ENABLE_ARRIVAL_DEPTH = True
 
 # OBI parameters
 ENABLE_OBI = True
-OBI_LEVELS = 50
-OBI_SMOOTH_ALPHA = 0.3
+OBI_LEVELS = 40
+OBI_SMOOTH_ALPHA = 0.4
 
 # TFI parameters
-ENABLE_TRADE_FLOW = False
+ENABLE_TRADE_FLOW = True
 TFI_WINDOW_SEC = 15.0
-TFI_SMOOTH_ALPHA = 0.3
+TFI_SMOOTH_ALPHA = 0.4
 
 # Adaptive scaling
-OBI_FRACTION_OF_HALFSPREAD = 0.3
-TFI_FRACTION_OF_HALFSPREAD = 0.5
+OBI_FRACTION_OF_HALFSPREAD = 0.25
+TFI_FRACTION_OF_HALFSPREAD = 0.25
 OBI_BETA_MIN_TICKS = 0.5
 OBI_BETA_MAX_TICKS = 50
 TFI_BETA_MIN_TICKS = 0.5
-TFI_BETA_MAX_TICKS = 70
+TFI_BETA_MAX_TICKS = 50
 
 # Smoothing
 SKEW_SMOOTH_ALPHA = 0.3
@@ -117,7 +134,6 @@ async def native_batch_place_orders_aster(
         post_only: bool = True,
         max_batch_size: int = 5,  # Aster limit appears to be 5 orders per batch
 ) -> Tuple[List[Dict], List[Dict]]:
-
     if not orders:
         return [], []
 
@@ -225,7 +241,6 @@ async def native_batch_cancel_orders_aster(
         order_ids: List[str],
         max_batch_size: int = 5,
 ) -> Tuple[List[Dict], List[str]]:
-
     if not order_ids:
         return [], []
 
@@ -331,7 +346,6 @@ async def ccxt_batch_place_orders_sequential(
         post_only: bool = True,
         max_concurrent: int = 10,
 ) -> Tuple[List[Dict], List[Dict]]:
-
     if not orders:
         return [], []
 
@@ -429,8 +443,7 @@ def compute_coeff(gamma, delta, A, k):
     return c1, c2
 
 
-def estimate_intensity(arrival_depths, window_sec=6000.0):
-
+def estimate_intensity(arrival_depths, window_sec=600.0):
     good = arrival_depths[~np.isnan(arrival_depths)]
     if len(good) == 0:
         return np.full(70, 1e-6, dtype=np.float64)
@@ -440,7 +453,6 @@ def estimate_intensity(arrival_depths, window_sec=6000.0):
 
 
 def extract_min_notional_from_filters(filters):
-
     candidates = []
     for f in filters:
         ftype = f.get('filterType', '')
@@ -458,7 +470,6 @@ def extract_min_notional_from_filters(filters):
 
 
 def sign_request(secret: str, query_string: str) -> str:
-
     if VERBOSE_FAILURES:
         print(f"[BATCH] Signing query string: {query_string[:150]}...")
 
@@ -520,7 +531,6 @@ async def smart_batch_place_orders(
         post_only: bool = True,
         use_native: bool = True,
 ) -> Tuple[List[Dict], List[Dict]]:
-
     if not orders:
         return [], []
 
@@ -565,7 +575,6 @@ async def smart_batch_cancel_orders(
         order_ids: List[str],
         use_native: bool = True,
 ) -> Tuple[List[Dict], List[str]]:
-
     if not order_ids:
         return [], []
 
@@ -603,6 +612,7 @@ async def smart_batch_cancel_orders(
         failed = order_ids
 
     return successful, failed
+
 
 # ---------------------------
 # EXCHANGE HELPERS
@@ -682,9 +692,9 @@ async def fetch_open_orders(exchange, symbol):
 # ---------------------------
 class GLFTGridMarketMaker:
     def __init__(self, exchange, exchange_trades, symbol, tick_size, lot_step, min_qty, max_qty, min_notional):
-        self.k = 0.05  # Add this
-        self.A = 1e-6  # Add this
-        self._k_ready = False  # Add this
+        self.k = 0.05
+        self.A = 1e-6
+        self._k_ready = False
         self.exchange = exchange
         self.exchange_trades = exchange_trades
         self.symbol = symbol
@@ -694,17 +704,17 @@ class GLFTGridMarketMaker:
         self.max_qty = max_qty
         self.min_notional = min_notional
 
-        # ========== GLFT CALCULATION STATE ==========
+        # ========== GLFT CALCULATION STATE (0.1-SECOND SAMPLING) ==========
         self.mid_history = deque(maxlen=GLFT_VOL_WINDOW)
-        self.arrival_depth = deque(maxlen=6000)
+        self.arrival_depth = deque(maxlen=ARRIVAL_DEPTH_BUFFER_SIZE)
         self.last_mid = None
 
-        # 1-second windowed arrival depths
-        self.arrival_depth_windowed = deque(maxlen=6000)
+        # 0.1-second windowed arrival depths
+        self.arrival_depth_windowed = deque(maxlen=ARRIVAL_DEPTH_BUFFER_SIZE)
         self.current_window_start = time.time()
         self.current_window_samples = []
 
-        # 1-second windowed mid prices
+        # 0.1-second windowed mid prices
         self.mid_history_windowed = deque(maxlen=GLFT_VOL_WINDOW)
         self.current_mid_window_start = time.time()
         self.current_mid_window_prices = []
@@ -798,6 +808,7 @@ class GLFTGridMarketMaker:
             if timeout_remaining > 0:
                 print(f"[WARMUP] Waiting for k parameter... "
                       f"windowed_samples={windowed_count}/{WARMUP_MIN_ARRIVAL_DEPTHS} "
+                      f"(need {WARMUP_MIN_ARRIVAL_DEPTHS * ARRIVAL_DEPTH_WINDOW_SIZE_SEC:.0f}s of trade data) "
                       f"timeout_in={timeout_remaining:.1f}s")
             else:
                 print(f"[WARMUP] Timeout reached. Using fallback spread (volatility-based).")
@@ -834,14 +845,14 @@ class GLFTGridMarketMaker:
         if ENABLE_WEBSOCKET_OB:
             print("[INIT] Starting order book WebSocket task...")
             self._orderbook_task = asyncio.create_task(self.update_orderbook_cache_task())
-            await asyncio.sleep(3.0)  # ← Longer delay to ensure connection established
+            await asyncio.sleep(3.0)
             print("[INIT] Order book WebSocket initialization complete")
 
         # WebSocket 2: Trades (uses self.exchange_trades - separate instance)
         if (ENABLE_ARRIVAL_DEPTH or ENABLE_TRADE_FLOW):
             print("[INIT] Starting trades WebSocket task...")
             self._trades_task = asyncio.create_task(self.update_trades_task())
-            await asyncio.sleep(3.0)  # ← Longer delay
+            await asyncio.sleep(3.0)
             print("[INIT] Trades WebSocket initialization complete")
 
         # OBI (uses orderbook data)
@@ -902,15 +913,23 @@ class GLFTGridMarketMaker:
             await asyncio.sleep(poll_interval)
 
     async def update_trades_task(self):
+        """
+        WebSocket task for trades with 0.1-second windowing.
+
+        SAMPLING STRATEGY:
+        - Aggregates trades into 0.1-second windows (100ms)
+        - Takes maximum arrival depth per window
+        - Maintains 60,000 samples (6000 seconds = 100 minutes of history)
+        """
 
         if not self.exchange_trades.has.get('watchTrades'):
             print(f"[TRADES] ✗ watchTrades not supported")
             return
 
-        print(f"[TRADES] Starting trades WebSocket for {self.symbol}...")
+        print(f"[TRADES] Starting trades WebSocket for {self.symbol} (0.1s windowing)...")
 
-        # ✅ Initialize to current second boundary
-        self.current_window_start = float(int(time.time()))
+        # ✅ Initialize to current 0.1-second boundary (decisecond)
+        self.current_window_start = float(int(time.time() * 10) / 10.0)
 
         total_trades_seen = 0
         message_count = 0
@@ -921,36 +940,36 @@ class GLFTGridMarketMaker:
 
                 message_count += 1
                 if message_count == 1:
-                    print(f"[TRADES] ✓✓✓ Trades WebSocket CONNECTED")
+                    print(f"[TRADES] ✓✓✓ Trades WebSocket CONNECTED (0.1s sampling)")
 
                 now_ms = int(time.time() * 1000)
                 current_time = time.time()
-                current_second = int(current_time)  # ✅ Floor to whole second
+                current_decisecond = float(int(current_time * 10) / 10.0)  # ✅ Floor to 0.1 second
 
-                # ✅ Clock-aligned windowing: Finalize at second boundaries
-                if current_second > int(self.current_window_start):
+                # ✅ Clock-aligned windowing: Finalize at 0.1-second boundaries
+                if current_decisecond > self.current_window_start:
                     async with self._trades_lock:
                         if self.current_window_samples:
                             window_depth = float(np.max(self.current_window_samples))
                             self.arrival_depth_windowed.append(window_depth)
 
                             # Enhanced logging with window timestamps
-                            if len(self.arrival_depth_windowed) % 5 == 0 or len(self.arrival_depth_windowed) <= 5:
+                            if len(self.arrival_depth_windowed) % 50 == 0 or len(self.arrival_depth_windowed) <= 10:
                                 print(
-                                    f"[TRADES] Window [{int(self.current_window_start)}.000s → {current_second}.000s]: "
+                                    f"[TRADES] Window [{self.current_window_start:.1f}s → {current_decisecond:.1f}s]: "
                                     f"{len(self.current_window_samples)} trades → "
                                     f"max_depth={window_depth:.3f} ticks | "
-                                    f"buffer={len(self.arrival_depth_windowed)}/6000"
+                                    f"buffer={len(self.arrival_depth_windowed)}/{ARRIVAL_DEPTH_BUFFER_SIZE}"
                                 )
                         else:
                             # No trades in this window - still finalize with empty window
-                            if VERBOSE_FAILURES and len(self.arrival_depth_windowed) <= 5:
+                            if VERBOSE_FAILURES and len(self.arrival_depth_windowed) <= 10:
                                 print(
-                                    f"[TRADES] Window [{int(self.current_window_start)}.000s → {current_second}.000s]: "
+                                    f"[TRADES] Window [{self.current_window_start:.1f}s → {current_decisecond:.1f}s]: "
                                     f"0 trades (no depth)"
                                 )
 
-                        self.current_window_start = float(current_second)  # ✅ Exact second
+                        self.current_window_start = current_decisecond  # ✅ Move to next 0.1-second boundary
                         self.current_window_samples = []
 
                 # Get mid-price for depth calculation
@@ -1020,7 +1039,7 @@ class GLFTGridMarketMaker:
                 if message_count % 100 == 0:
                     print(
                         f"[TRADES] ✓ {message_count} batches | {total_trades_seen} total trades | "
-                        f"buffer={len(self.arrival_depth_windowed)}/6000"
+                        f"buffer={len(self.arrival_depth_windowed)}/{ARRIVAL_DEPTH_BUFFER_SIZE}"
                     )
 
         except asyncio.CancelledError:
@@ -1052,7 +1071,7 @@ class GLFTGridMarketMaker:
                     try:
                         ob = await asyncio.wait_for(
                             self.exchange.watch_order_book(self.symbol),
-                            timeout=30.0  # 30s timeout
+                            timeout=30.0
                         )
                         message_count += 1
 
@@ -1071,7 +1090,7 @@ class GLFTGridMarketMaker:
 
                     except asyncio.TimeoutError:
                         print(f"[OBI] Timeout waiting for orderbook update (30s)")
-                        raise  # Trigger reconnection
+                        raise
 
             except asyncio.CancelledError:
                 print("[OBI] Orderbook WebSocket task cancelled.")
@@ -1135,7 +1154,6 @@ class GLFTGridMarketMaker:
 
                 while True:
                     try:
-                        # Add explicit timeout warning
                         if not first_message_received:
                             print(f"[OB_CACHE] Waiting for first orderbook message (30s timeout)...")
 
@@ -1218,14 +1236,23 @@ class GLFTGridMarketMaker:
                 )
 
     async def compute_glft_metrics_task(self):
+        """
+        Compute GLFT metrics with 0.1-second sampling.
 
-        # ✅ Initialize to current second boundary (clock-aligned)
-        self.current_mid_window_start = float(int(time.time()))
+        SAMPLING STRATEGY:
+        - Mid-prices: 0.1-second windows (mean per window)
+        - Volatility: std dev of 0.1-second changes, scaled to 1-second
+        - K parameter: estimated from 0.1-second arrival depth samples
+        - Maintains 300 seconds (5 minutes) of mid-price history
+        """
+
+        # ✅ Initialize to current 0.1-second boundary (clock-aligned)
+        self.current_mid_window_start = float(int(time.time() * 10) / 10.0)
 
         computation_count = 0
         last_k_estimation = 0
 
-        print(f"[GLFT_CALC] Task started - clock-aligned windowing enabled")
+        print(f"[GLFT_CALC] Task started - 0.1-second clock-aligned windowing enabled")
 
         while True:
             try:
@@ -1263,13 +1290,13 @@ class GLFTGridMarketMaker:
 
                 mid = (best_bid + best_ask) / 2.0
                 current_time = time.time()
-                current_second = int(current_time)  # ✅ Floor to whole second
+                current_decisecond = float(int(current_time * 10) / 10.0)  # ✅ Floor to 0.1 second
 
-                # ========== MID-PRICE WINDOWING (CLOCK-ALIGNED) ==========
-                # Finalize window at exact second boundaries
-                if current_second > int(self.current_mid_window_start):
+                # ========== MID-PRICE WINDOWING (0.1-SECOND CLOCK-ALIGNED) ==========
+                # Finalize window at exact 0.1-second boundaries
+                if current_decisecond > self.current_mid_window_start:
                     if self.current_mid_window_prices:
-                        # Compute mean mid-price for the completed window
+                        # Compute mean mid-price for the completed 0.1-second window
                         window_mid = float(np.mean(self.current_mid_window_prices))
 
                         # CRITICAL: Convert to ticks before storing (backtest-consistent)
@@ -1283,47 +1310,50 @@ class GLFTGridMarketMaker:
 
                         # Debug logging
                         if VERBOSE_FAILURES and (
-                                len(self.mid_history_windowed) % 5 == 0 or len(self.mid_history_windowed) <= 5):
+                                len(self.mid_history_windowed) % 50 == 0 or len(self.mid_history_windowed) <= 10):
                             print(
-                                f"[GLFT_CALC] Mid window [{int(self.current_mid_window_start)}.000s → {current_second}.000s]: "
+                                f"[GLFT_CALC] Mid window [{self.current_mid_window_start:.1f}s → {current_decisecond:.1f}s]: "
                                 f"{len(self.current_mid_window_prices)} samples → mean_tick={window_mid_tick:.4f}"
                             )
                     else:
                         # Empty window (no samples collected)
-                        if VERBOSE_FAILURES and len(self.mid_history_windowed) <= 5:
+                        if VERBOSE_FAILURES and len(self.mid_history_windowed) <= 10:
                             print(
-                                f"[GLFT_CALC] Mid window [{int(self.current_mid_window_start)}.000s → {current_second}.000s]: "
+                                f"[GLFT_CALC] Mid window [{self.current_mid_window_start:.1f}s → {current_decisecond:.1f}s]: "
                                 f"0 samples (no data)"
                             )
 
-                    # Reset window to current second boundary
-                    self.current_mid_window_start = float(current_second)
+                    # Reset window to current 0.1-second boundary
+                    self.current_mid_window_start = current_decisecond
                     self.current_mid_window_prices = []
 
                 # Collect current mid-price sample
                 self.current_mid_window_prices.append(mid)
 
-                # ========== K PARAMETER ESTIMATION ==========
-                # Estimate k every 50 iterations (or when threshold met)
+                # ========== K PARAMETER ESTIMATION (0.1-SECOND SAMPLING → 1-SECOND INTENSITY) ==========
                 k_is_valid = False
 
-                if (computation_count - last_k_estimation >= 50) and len(
-                        self.arrival_depth_windowed) >= WARMUP_MIN_ARRIVAL_DEPTHS:
+                if (computation_count - last_k_estimation >= K_ESTIMATION_UPDATE_INTERVAL) and \
+                        len(self.arrival_depth_windowed) >= K_ESTIMATION_MIN_SAMPLES:
                     try:
-                        # Get windowed arrival depths
+                        # Get windowed arrival depths (each sample = 0.1 second window)
                         depths = np.array(self.arrival_depth_windowed, dtype=np.float64)
 
-                        # CRITICAL: Compute actual observation window duration
-                        # Each sample represents ARRIVAL_DEPTH_WINDOW_SIZE_SEC (1.0 second)
+                        # CRITICAL: Each sample represents 0.1 seconds
+                        # Total observation window in seconds
                         window_sec = len(depths) * ARRIVAL_DEPTH_WINDOW_SIZE_SEC
 
-                        # Cap at 600 seconds (10 minutes) for backtest consistency
-                        if len(depths) >= 600:
-                            window_sec = 600.0
+                        # Cap at K_ESTIMATION_MAX_WINDOW_SEC for backtest consistency
+                        if window_sec > K_ESTIMATION_MAX_WINDOW_SEC:
+                            window_sec = K_ESTIMATION_MAX_WINDOW_SEC
+                            # Use only the most recent samples that fit in the window
+                            max_samples = int(K_ESTIMATION_MAX_WINDOW_SEC / ARRIVAL_DEPTH_WINDOW_SIZE_SEC)
+                            depths = depths[-max_samples:]
+                            window_sec = len(depths) * ARRIVAL_DEPTH_WINDOW_SIZE_SEC
 
                         if VERBOSE_FAILURES:
                             print(
-                                f"[GLFT_CALC] Estimating k from {len(depths)} windowed samples "
+                                f"[GLFT_CALC] Estimating k from {len(depths)} windowed samples (0.1s each) "
                                 f"(observation window = {window_sec:.1f}s)"
                             )
 
@@ -1331,12 +1361,24 @@ class GLFTGridMarketMaker:
                         good = depths[~np.isnan(depths)]
 
                         if len(good) > 0:
-                            # Estimate intensity: λ(δ) = events per second at depth δ
+                            # Estimate intensity: λ(δ) = events per SECOND at depth δ
                             # BACKTEST-CONSISTENT: Use 70 bins, range [0, 40) ticks
                             counts, _ = np.histogram(good, bins=70, range=(0, 40))
 
                             # CRITICAL: Normalize by actual window duration in seconds
+                            # This gives us intensity in events per second
+                            #
+                            # Example: If we see 100 events at depth δ over 60 seconds (600 samples × 0.1s),
+                            # then λ(δ) = 100 / 60 = 1.67 events per second
                             lambda_ = (counts + 1e-6) / float(window_sec)
+
+                            if VERBOSE_FAILURES:
+                                total_events = np.sum(counts)
+                                avg_intensity = total_events / window_sec
+                                print(
+                                    f"[GLFT_CALC] Total events: {total_events} over {window_sec:.1f}s "
+                                    f"→ avg intensity: {avg_intensity:.3f} events/sec"
+                                )
                         else:
                             # No valid depths - use uniform low intensity
                             lambda_ = np.full(70, 1e-6, dtype=np.float64)
@@ -1361,8 +1403,8 @@ class GLFTGridMarketMaker:
                             last_k_estimation = computation_count
 
                             print(
-                                f"[GLFT_CALC] k updated from {len(depths)} windowed samples "
-                                f"(window_sec={window_sec:.1f}): k={self.k:.6f} A={self.A:.3g}"
+                                f"[GLFT_CALC] ✓ k updated: k={self.k:.6f} A={self.A:.3g} events/sec | "
+                                f"from {len(depths)} samples (0.1s) over {window_sec:.1f}s window"
                             )
                         else:
                             if VERBOSE_FAILURES:
@@ -1376,16 +1418,25 @@ class GLFTGridMarketMaker:
                             import traceback
                             traceback.print_exc()
 
-                # ========== VOLATILITY CALCULATION (TICKS) ==========
-                # BACKTEST-CONSISTENT: Volatility of 1-second mid-price changes in ticks
+                # ========== VOLATILITY CALCULATION (0.1-SECOND → 1-SECOND) ==========
                 if len(self.mid_history_windowed) > 3:
-                    # mid_history_windowed contains mid-prices in TICKS
-                    # Compute differences: Δmid_tick(t) = mid_tick(t) - mid_tick(t-1)
+                    # mid_history_windowed contains mid-prices in TICKS (0.1-second sampling)
                     mid_arr = np.array(self.mid_history_windowed, dtype=np.float64)
-                    diffs = np.diff(mid_arr)  # 1-second changes in ticks
+                    diffs = np.diff(mid_arr)  # 0.1-second changes in ticks
 
-                    # Standard deviation of tick changes
-                    self.volatility_ticks = float(np.nanstd(diffs)) * math.sqrt(10)
+                    # Standard deviation of 0.1-second tick changes
+                    vol_0_1_sec = float(np.nanstd(diffs))
+
+                    # Scale to 1-second volatility: σ(1s) = σ(0.1s) × √(1.0 / 0.1) = σ(0.1s) × √10
+                    # Theoretical justification: Random walk scaling law σ(Δt₂) = σ(Δt₁) × √(Δt₂/Δt₁)
+                    self.volatility_ticks = vol_0_1_sec * VOLATILITY_SCALING_FACTOR
+
+                    if VERBOSE_FAILURES and computation_count % 10 == 0:
+                        print(
+                            f"[GLFT_CALC] Volatility: "
+                            f"0.1s_std={vol_0_1_sec:.4f} ticks → "
+                            f"1s_vol={self.volatility_ticks:.4f} ticks (×√10)"
+                        )
                 else:
                     # Not enough history - use safe default
                     self.volatility_ticks = 1.0
@@ -1410,25 +1461,14 @@ class GLFTGridMarketMaker:
                         ))
 
                         # Dynamic delta (inventory risk aversion parameter)
-                        # Option 1: Fixed delta (strict backtest)
-                        # delta = GLFT_DELTA_MIN  # e.g., 1.0
-
-                        # Option 2: Position-dependent delta (adaptive)
                         delta = GLFT_DELTA_MIN + GLFT_DELTA_SLOPE * abs(normalized_position)
                         delta = float(np.clip(delta, GLFT_DELTA_MIN, GLFT_DELTA_MAX))
 
                         # Compute GLFT coefficients
-                        # c1: spread component (from k)
-                        # c2: inventory adjustment component
                         c1, c2 = compute_coeff(GLFT_GAMMA, GLFT_DELTA_MIN, self.A, self.k)
 
                         # BACKTEST-CONSISTENT SPREAD FORMULA (GLFT paper Eq. 13):
                         # δ^± = c1 + (δ/2) * c2 * σ
-                        # where:
-                        #   c1 = (1/k) * log(1 + k/γ)
-                        #   c2 = 1 / (γ + k)
-                        #   δ = inventory risk aversion
-                        #   σ = volatility in ticks per window
                         half_spread_tick = (c1 + (delta / 2.0) * c2 * self.volatility_ticks) * HALF_SPREAD_COEFF
 
                         # Validate spread
@@ -1469,7 +1509,7 @@ class GLFTGridMarketMaker:
                     self._k_ready = True
                     elapsed = time.time() - self._warmup_started
                     print(
-                        f"[GLFT_CALC] ✓✓✓ k parameter ready after {elapsed:.1f}s (TRADE-BASED arrival depths)"
+                        f"[GLFT_CALC] ✓✓✓ k parameter ready after {elapsed:.1f}s (0.1s TRADE-BASED arrival depths)"
                     )
                     print(
                         f"[GLFT_CALC] Parameters: k={self.k:.6f} A={self.A:.3g} "
@@ -1487,6 +1527,7 @@ class GLFTGridMarketMaker:
                         print(
                             f"[GLFT_CALC] warming up (waiting for trades) | {ws_status} | "
                             f"trade_depths={windowed_count}/{WARMUP_MIN_ARRIVAL_DEPTHS} "
+                            f"({windowed_count * ARRIVAL_DEPTH_WINDOW_SIZE_SEC:.0f}s of data) "
                             f"mid_hist_ticks={windowed_mid_count} "
                             f"A={self.A:.3g} k={self.k:.6f} vol_ticks={self.volatility_ticks:.3f} "
                             f"half_spread={half_spread_tick:.2f}"
@@ -1503,7 +1544,7 @@ class GLFTGridMarketMaker:
                         print(
                             f"[GLFT_CALC] pos={pos_base:.6f} norm={normalized_position:.4f} | "
                             f"A={self.A:.3g} k={self.k:.6f} vol_ticks={self.volatility_ticks:.3f} | "
-                            f"depths={windowed_count}/6000 mid_hist={windowed_mid_count}/{GLFT_VOL_WINDOW}"
+                            f"depths={windowed_count}/{ARRIVAL_DEPTH_BUFFER_SIZE} mid_hist={windowed_mid_count}/{GLFT_VOL_WINDOW}"
                         )
 
             except asyncio.CancelledError:
@@ -1665,38 +1706,68 @@ class GLFTGridMarketMaker:
             else:
                 half_spread_tick = glft_metrics.get('half_spread_tick', 1.0)
 
-            # ========== CALCULATE SKEW ==========
+            # ========== CALCULATE SKEW WITH DETAILED BREAKDOWN ==========
             tfi = await self.get_cached_tfi() if ENABLE_TRADE_FLOW else 0.0
             obi = await self.get_cached_obi() if ENABLE_OBI else 0.0
 
+            # Initialize skew components
+            inv_skew_ticks = 0.0
+            obi_skew_ticks = 0.0
+            tfi_skew_ticks = 0.0
             skew_ticks = 0.0
+
             if self._k_ready and np.isfinite(self.k):
                 c1, c2 = compute_coeff(GLFT_GAMMA, GLFT_DELTA_MIN, self.A, self.k)
                 volatility_ticks = glft_metrics.get('volatility_ticks', 1.0)
 
+                # 1. INVENTORY SKEW (position-based)
                 base_skew_per_unit = c2 * volatility_ticks
                 inv_skew_ticks = base_skew_per_unit * SKEW_COEFF * normalized_position
 
+                # 2. OBI SKEW (order book imbalance)
                 beta_obi_eff = 0.0
                 if ENABLE_OBI:
                     beta_obi_raw = OBI_FRACTION_OF_HALFSPREAD * half_spread_tick
                     beta_obi_eff = float(np.clip(beta_obi_raw, OBI_BETA_MIN_TICKS, OBI_BETA_MAX_TICKS))
+                    obi_skew_ticks = beta_obi_eff * obi
 
+                # 3. TFI SKEW (trade flow imbalance)
                 beta_tfi_eff = 0.0
                 if ENABLE_TRADE_FLOW:
                     beta_tfi_raw = TFI_FRACTION_OF_HALFSPREAD * half_spread_tick
                     beta_tfi_eff = float(np.clip(beta_tfi_raw, TFI_BETA_MIN_TICKS, TFI_BETA_MAX_TICKS))
+                    tfi_skew_ticks = beta_tfi_eff * tfi
 
-                alpha_skew_ticks = 0.0
-                if ENABLE_OBI:
-                    alpha_skew_ticks += beta_obi_eff * obi
-                if ENABLE_TRADE_FLOW:
-                    alpha_skew_ticks += beta_tfi_eff * tfi
+                # 4. TOTAL ALPHA SKEW (market signals)
+                alpha_skew_ticks = obi_skew_ticks + tfi_skew_ticks
 
+                # 5. COMBINED SKEW (inventory adjustment minus market signals)
                 skew_ticks_target = inv_skew_ticks - alpha_skew_ticks
                 self._skew_ticks_smooth = skew_ticks_target
+
+                # 6. APPLY CAP
                 skew_cap_ticks = SKEW_FRACTION_OF_HALFSPREAD_CAP * half_spread_tick
                 skew_ticks = float(np.clip(self._skew_ticks_smooth, -skew_cap_ticks, skew_cap_ticks))
+
+                # ========== DETAILED SKEW LOGGING ==========
+                print(
+                    f"[SKEW] pos={pos_base:.6f} norm_pos={normalized_position:.4f} | "
+                    f"INV_SKEW={inv_skew_ticks:+.3f} ticks "
+                    f"(c2={c2:.3f} × vol={volatility_ticks:.3f} × coeff={SKEW_COEFF:.3f} × norm={normalized_position:.2f})"
+                )
+
+                if ENABLE_OBI or ENABLE_TRADE_FLOW:
+                    print(
+                        f"[SKEW] obi={obi:+.4f} tfi={tfi:+.4f} | "
+                        f"OBI_SKEW={obi_skew_ticks:+.3f} ticks (beta={beta_obi_eff:.2f} × obi) | "
+                        f"TFI_SKEW={tfi_skew_ticks:+.3f} ticks (beta={beta_tfi_eff:.2f} × tfi)"
+                    )
+
+                print(
+                    f"[SKEW] TOTAL: inventory={inv_skew_ticks:+.3f} - alpha={alpha_skew_ticks:+.3f} "
+                    f"= raw={skew_ticks_target:+.3f} → capped={skew_ticks:+.3f} ticks "
+                    f"(cap=±{skew_cap_ticks:.2f})"
+                )
 
         except Exception as e:
             print(f"[ERROR] Cache read error: {e}")
@@ -1795,7 +1866,7 @@ class GLFTGridMarketMaker:
         active_order_price_ticks = set(
             price_to_tick_index(o['price'], self.tick_size)
             for o in open_orders
-            if o['id'] not in canceled_ids  # Exclude just-canceled orders
+            if o['id'] not in canceled_ids
         )
 
         new_orders_spec = []
@@ -1856,18 +1927,15 @@ class GLFTGridMarketMaker:
             if VERBOSE_FAILURES and t % 10 == 0:
                 print(f"[ORDER_FLOW] No new orders to place")
 
-        # ========== LOGGING ==========
+        # ========== SUMMARY LOGGING ==========
         ws_status = "WS" if self._ws_connected else "REST"
         print(
-            f"[GLFT] t={t} pos={pos_base:.6f} norm_pos={normalized_position:.4f} "
-            f"A={glft_metrics.get('A', self.A):.3g} k={glft_metrics.get('k', self.k):.3g} "
-            f"vol_ticks={glft_metrics.get('volatility_ticks', 1.0):.3f} "
-            f"dyn_delta={dyn_delta:.3f} "
-            f"skew_ticks={skew_ticks:.3f} "
-            f"mid={mid:.2f} dyn_qty={dyn_qty:.6f} dyn_notional≈{dyn_qty * mid:.2f} "
-            f"bid={bid_price:.2f} ask={ask_price:.2f} half_spread_ticks={half_spread_tick:.2f} "
-            f"open={len(open_orders)} canceled={len(canceled_ids)} placed={len(placed_results)} "
-            f"ob_source={ws_status} ob_age_ms={ob_age} glft_age_ms={glft_age}"
+            f"[GLFT] t={t} mid={mid:.2f} dyn_qty={dyn_qty:.6f} notional≈{dyn_qty * mid:.2f} | "
+            f"A={glft_metrics.get('A', self.A):.3g} k={glft_metrics.get('k', self.k):.6f} vol_ticks={glft_metrics.get('volatility_ticks', 1.0):.3f} | "
+            f"half_spread={half_spread_tick:.2f} ticks res_price_tick={reservation_price_tick:.2f} | "
+            f"bid={bid_price:.2f} ask={ask_price:.2f} | "
+            f"open={len(open_orders)} canceled={len(canceled_ids)} placed={len(placed_results)} | "
+            f"{ws_status} ob_age={ob_age}ms glft_age={glft_age}ms"
         )
 
     async def run_live(self):
@@ -1930,7 +1998,8 @@ async def main():
     await exchange_trades.load_markets()
 
     print(f"[INFO] Exchange: {exchange.id}")
-    print(f"[INFO] Symbol: {SYMBOL}\n")
+    print(f"[INFO] Symbol: {SYMBOL}")
+    print(f"[INFO] Using 0.1-second sampling for arrival depth and volatility\n")
 
     # ========== Open Order Book WebSocket ==========
     print(f"[INFO] Opening order book WebSocket connection...")
@@ -1968,8 +2037,8 @@ async def main():
 
     # Pass BOTH exchange instances to the bot
     mm = GLFTGridMarketMaker(
-        exchange,  # ← Main exchange (orderbook, orders, positions)
-        exchange_trades,  # ← Trades exchange (trades WebSocket only)
+        exchange,
+        exchange_trades,
         SYMBOL,
         filters['tick_size'],
         filters['lot_step'],
@@ -1982,7 +2051,7 @@ async def main():
         await mm.run_live()
     finally:
         await exchange.close()
-        await exchange_trades.close()  # ← Close both
+        await exchange_trades.close()
 
 
 if __name__ == "__main__":
