@@ -31,15 +31,15 @@ QUOTE_INTERVAL_SEC = 0.1
 POSITION_POLL_INTERVAL_SEC = 2.0
 OPEN_ORDERS_POLL_INTERVAL_SEC = 2.0
 
-MAX_POSITION_BASE = 0.003 * 25
+MAX_POSITION_BASE = 0.003 * 50
 ORDER_QTY_BASE = 0.003
 GRID_NUM = 10
 HALF_SPREAD_COEFF = 1
-SKEW_COEFF = 0.03
-MAX_NORM_POS = 25.0
+SKEW_COEFF = 0.5
+MAX_NORM_POS = 50.0
 
 # GLFT parameters
-GLFT_GAMMA = 0.15
+GLFT_GAMMA = 0.005
 
 # ---------------------------
 # TIMING & WINDOWING CONFIG (0.1 SECOND SAMPLING)
@@ -91,18 +91,18 @@ ENABLE_NATIVE_BATCH = True
 BATCH_MAX_CONCURRENT = 5
 BATCH_PLACE_TIMEOUT_SEC = 5.0
 BATCH_CANCEL_TIMEOUT_SEC = 5.0
-CANCEL_TO_PLACE_DELAY_SEC = 0.0  # Delay between cancel and place operations
+CANCEL_TO_PLACE_DELAY_SEC = 10.0  # Delay between cancel and place operations
 
 # Arrival depth measurement (REQUIRED for k estimation)
 ENABLE_ARRIVAL_DEPTH = True
 
 # OBI parameters
-ENABLE_OBI = True
+ENABLE_OBI = False
 OBI_LEVELS = 40
 OBI_SMOOTH_ALPHA = 0.4
 
 # TFI parameters
-ENABLE_TRADE_FLOW = True
+ENABLE_TRADE_FLOW = False
 TFI_WINDOW_SEC = 15.0
 TFI_SMOOTH_ALPHA = 0.4
 
@@ -117,9 +117,9 @@ TFI_BETA_MAX_TICKS = 50
 # Smoothing
 SKEW_SMOOTH_ALPHA = 0.3
 NORM_POS_SMOOTH_ALPHA = 0.3
-SKEW_FRACTION_OF_HALFSPREAD_CAP = 6
+SKEW_FRACTION_OF_HALFSPREAD_CAP = 10
 
-DRY_RUN = False
+DRY_RUN = True
 POST_ONLY = True
 MAX_CONSEC_ERRORS = 15
 VERBOSE_FAILURES = True
@@ -436,11 +436,29 @@ def linear_regression(x, y):
 
 
 def compute_coeff(gamma, delta, A, k):
-    if np.isnan(A) or np.isnan(k) or k == 0:
-        return 0.5, 0.5
-    c1 = 1 / k * np.log(1 + k / gamma)
-    c2 = 1 / (gamma + k)
+    """
+    Backtest-aligned formula with xi = gamma
+
+    More aggressive than GLFT:
+    - Tighter spreads (2.5× narrower)
+    - Weaker position adjustment (2.2× smaller)
+    """
+    xi = gamma  # Key: xi = gamma in your backtest
+
+    inv_k = 1 / k
+    c1 = 1 / (xi * delta) * np.log(1 + xi * delta * inv_k)
+    c2 = np.sqrt((gamma / (2 * A * delta * k)) *
+                 ((1 + xi * delta * inv_k) ** (k / (xi * delta) + 1)))
+
     return c1, c2
+
+
+# def compute_coeff(gamma, delta, A, k):
+#     if np.isnan(A) or np.isnan(k) or k == 0:
+#         return 0.5, 0.5
+#     c1 = 1 / k * np.log(1 + k / gamma)
+#     c2 = 1 / (gamma + k)
+#     return c1, c2
 
 
 def estimate_intensity(arrival_depths, window_sec=600.0):
@@ -1361,50 +1379,33 @@ class GLFTGridMarketMaker:
                         good = depths[~np.isnan(depths)]
 
                         if len(good) > 0:
-                            # Estimate intensity: λ(δ) = events per SECOND at depth δ
-                            # BACKTEST-CONSISTENT: Use 70 bins, range [0, 40) ticks
-                            counts, _ = np.histogram(good, bins=70, range=(0, 40))
-
-                            # CRITICAL: Normalize by actual window duration in seconds
-                            # This gives us intensity in events per second
-                            #
-                            # Example: If we see 100 events at depth δ over 60 seconds (600 samples × 0.1s),
-                            # then λ(δ) = 100 / 60 = 1.67 events per second
+                            # ✅ MATCH BACKTEST: 500 bins, range [0, 500) ticks
+                            counts, _ = np.histogram(good, bins=250, range=(0, 250))
                             lambda_ = (counts + 1e-6) / float(window_sec)
-
-                            if VERBOSE_FAILURES:
-                                total_events = np.sum(counts)
-                                avg_intensity = total_events / window_sec
-                                print(
-                                    f"[GLFT_CALC] Total events: {total_events} over {window_sec:.1f}s "
-                                    f"→ avg intensity: {avg_intensity:.3f} events/sec"
-                                )
                         else:
-                            # No valid depths - use uniform low intensity
-                            lambda_ = np.full(70, 1e-6, dtype=np.float64)
+                            lambda_ = np.full(250, 1e-6, dtype=np.float64)
 
-                        # Linear regression on log(λ) vs depth ticks
-                        # Theory: λ(δ) = A * exp(-k * δ)  =>  log(λ) = log(A) - k * δ
-                        ticks = np.arange(len(lambda_)) + 0.5  # Bin centers: 0.5, 1.5, 2.5, ...
-                        x = ticks
-                        y = np.log(lambda_)
+                        # Ticks from mid-price
+                        ticks = np.arange(len(lambda_)) + 0.5  # [0.5, 1.5, ..., 499.5]
 
-                        # Fit: y = slope * x + intercept
-                        k_, logA = linear_regression(x, y)
+                        # ✅ MATCH BACKTEST: Refit to first 70 ticks
+                        x_shallow = ticks[:15]  # [0.5, 1.5, ..., 69.5]
+                        lambda_shallow = lambda_[:15]
+                        y_shallow = np.log(lambda_shallow)
 
-                        # k is negative slope (intensity decays with depth)
-                        k_ = max(-k_, 1e-6)  # Ensure positive k
+                        # Linear regression
+                        k_, logA = linear_regression(x_shallow, y_shallow)
+                        k_ = max(-k_, 1e-6)  # k is negative slope
 
                         # Validate k
                         if np.isfinite(k_) and not np.isnan(k_) and k_ > MIN_VALID_K:
                             self.A = np.exp(logA)
                             self.k = k_
                             k_is_valid = True
-                            last_k_estimation = computation_count
 
                             print(
-                                f"[GLFT_CALC] ✓ k updated: k={self.k:.6f} A={self.A:.3g} events/sec | "
-                                f"from {len(depths)} samples (0.1s) over {window_sec:.1f}s window"
+                                f"[GLFT_CALC] ✓ k updated (BACKTEST-ALIGNED): k={self.k:.6f} A={self.A:.3g} | "
+                                f"fitted 0-70 ticks from {len(depths)} samples (0.1s) over {window_sec:.1f}s"
                             )
                         else:
                             if VERBOSE_FAILURES:
