@@ -91,7 +91,7 @@ ENABLE_NATIVE_BATCH = True
 BATCH_MAX_CONCURRENT = 5
 BATCH_PLACE_TIMEOUT_SEC = 5.0
 BATCH_CANCEL_TIMEOUT_SEC = 5.0
-CANCEL_TO_PLACE_DELAY_SEC = 10.0  # Delay between cancel and place operations
+CANCEL_TO_PLACE_DELAY_SEC = 0.1  # Delay between cancel and place operations
 
 # Arrival depth measurement (REQUIRED for k estimation)
 ENABLE_ARRIVAL_DEPTH = True
@@ -1816,15 +1816,73 @@ class GLFTGridMarketMaker:
         grid_ask_ticks = set(new_asks.keys())
 
         order_ids_to_cancel = []
-        if CANCEL_STRATEGY == 'stale':
+
+        # ========== SAFETY CHECK: Enforce maximum order count ==========
+        MAX_ALLOWED_ORDERS = GRID_NUM * 2 + 4  # 24 orders max (20 target + 4 buffer)
+
+        if len(open_orders) > MAX_ALLOWED_ORDERS:
+            print(f"[WARN] ⚠️ Too many open orders ({len(open_orders)} > {MAX_ALLOWED_ORDERS}). Forcing CANCEL ALL.")
+            order_ids_to_cancel = [o['id'] for o in open_orders]
+
+        elif CANCEL_STRATEGY == 'all':
+            print(f"[CANCEL] Strategy='all' - Canceling all {len(open_orders)} orders")
+            order_ids_to_cancel = [o['id'] for o in open_orders]
+
+        elif CANCEL_STRATEGY == 'stale':
+            # Separate tracking for bids and asks at each tick
+            open_bid_ticks = {}  # tick -> [order_ids]
+            open_ask_ticks = {}  # tick -> [order_ids]
+
             for o in open_orders:
                 side = o['side'].lower()
                 tick = price_to_tick_index(o['price'], self.tick_size)
-                if (side == 'buy' and tick not in grid_bid_ticks) or \
-                        (side == 'sell' and tick not in grid_ask_ticks):
-                    order_ids_to_cancel.append(o['id'])
-        elif CANCEL_STRATEGY == 'all':
-            order_ids_to_cancel = [o['id'] for o in open_orders]
+
+                if side == 'buy':
+                    if tick not in open_bid_ticks:
+                        open_bid_ticks[tick] = []
+                    open_bid_ticks[tick].append(o['id'])
+                elif side == 'sell':
+                    if tick not in open_ask_ticks:
+                        open_ask_ticks[tick] = []
+                    open_ask_ticks[tick].append(o['id'])
+
+            # Cancel bids not in target grid
+            for tick, order_ids in open_bid_ticks.items():
+                if tick not in grid_bid_ticks:
+                    # Cancel all bids at this tick (not in grid)
+                    order_ids_to_cancel.extend(order_ids)
+                else:
+                    # Keep only first bid, cancel duplicates
+                    if len(order_ids) > 1:
+                        order_ids_to_cancel.extend(order_ids[1:])
+
+            # Cancel asks not in target grid
+            for tick, order_ids in open_ask_ticks.items():
+                if tick not in grid_ask_ticks:
+                    # Cancel all asks at this tick (not in grid)
+                    order_ids_to_cancel.extend(order_ids)
+                else:
+                    # Keep only first ask, cancel duplicates
+                    if len(order_ids) > 1:
+                        order_ids_to_cancel.extend(order_ids[1:])
+
+            # Log stale strategy results
+            if VERBOSE_FAILURES or len(order_ids_to_cancel) > 0:
+                open_bids_count = sum(len(ids) for ids in open_bid_ticks.values())
+                open_asks_count = sum(len(ids) for ids in open_ask_ticks.values())
+                print(f"[CANCEL] Strategy='stale' - Open: {open_bids_count} bids, {open_asks_count} asks | "
+                      f"Target: {len(grid_bid_ticks)} bid levels, {len(grid_ask_ticks)} ask levels | "
+                      f"Canceling: {len(order_ids_to_cancel)} orders")
+
+        else:
+            print(f"[ERROR] Unknown CANCEL_STRATEGY: '{CANCEL_STRATEGY}'")
+            order_ids_to_cancel = []
+
+        # ========== VALIDATE CANCEL LIST ==========
+        if order_ids_to_cancel:
+            # Remove duplicates
+            order_ids_to_cancel = list(set(order_ids_to_cancel))
+            print(f"[CANCEL] Total orders to cancel: {len(order_ids_to_cancel)} (after deduplication)")
 
         # ========== STEP 1: CANCEL ORDERS ==========
         canceled_ids = []
@@ -1855,6 +1913,20 @@ class GLFTGridMarketMaker:
             await self.mutate_cached_orders_remove(canceled_ids)
 
             print(f"[ORDER_FLOW] ✓ Canceled {len(canceled_ids)}/{len(order_ids_to_cancel)} orders")
+
+            # ========== FORCE REFRESH AFTER CANCEL-ALL ==========
+            if len(canceled_ids) >= GRID_NUM * 2:  # If we canceled most/all orders
+                print("[ORDER_FLOW] Large cancel detected - forcing fresh order fetch from exchange...")
+                await asyncio.sleep(0.5)  # Give exchange time to process
+
+                fresh_orders = await fetch_open_orders(self.exchange, self.symbol)
+                async with self._orders_lock:
+                    self._open_orders = fresh_orders
+
+                print(f"[ORDER_FLOW] Fresh fetch: {len(fresh_orders)} orders remain on exchange")
+
+                # Update open_orders for this cycle
+                open_orders = fresh_orders
 
             # Delay before placing
             if canceled_ids and CANCEL_TO_PLACE_DELAY_SEC > 0:
