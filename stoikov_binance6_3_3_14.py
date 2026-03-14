@@ -42,7 +42,7 @@ MAX_NORM_POS = 50.0
 GLFT_GAMMA = 0.005
 
 # ---------------------------
-# TIMING & WINDOWING CONFIG (0.1 SECOND SAMPLING)
+# TIMING & WINDOWING CONFIG (0.1   SECOND SAMPLING)
 # ---------------------------
 
 # Arrival depth calculation (0.1 second sampling)
