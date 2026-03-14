@@ -91,7 +91,9 @@ ENABLE_NATIVE_BATCH = True
 BATCH_MAX_CONCURRENT = 5
 BATCH_PLACE_TIMEOUT_SEC = 5.0
 BATCH_CANCEL_TIMEOUT_SEC = 5.0
-CANCEL_TO_PLACE_DELAY_SEC = 0.1  # Delay between cancel and place operations
+CANCEL_TO_PLACE_DELAY_SEC = 0.5  # Delay between cancel and place operations
+POST_PLACEMENT_SYNC_DELAY_SEC = 0.5  # Delay before refreshing cache after placement
+ORDER_CACHE_SYNC_INTERVAL = 10  # Sync order cache from exchange every N cycles
 
 # Arrival depth measurement (REQUIRED for k estimation)
 ENABLE_ARRIVAL_DEPTH = True
@@ -430,6 +432,12 @@ def ewma(prev, new, alpha):
 
 
 def linear_regression(x, y):
+    x = np.atleast_1d(x)
+    y = np.atleast_1d(y)
+
+    if len(x) < 2 or len(y) < 2:
+        return 0.05, np.log(1e-6)
+
     A = np.vstack([x, np.ones(len(x))]).T
     k, b = np.linalg.lstsq(A, y, rcond=None)[0]
     return k, b
@@ -855,9 +863,11 @@ class GLFTGridMarketMaker:
         self._position_task = asyncio.create_task(
             self.update_position_task(POSITION_POLL_INTERVAL_SEC)
         )
-        self._orders_task = asyncio.create_task(
-            self.update_orders_task(OPEN_ORDERS_POLL_INTERVAL_SEC)
-        )
+        # NOTE: Background order polling disabled to prevent race condition with manual cache
+        # management. Periodic refresh is handled in run_once() instead.
+        # self._orders_task = asyncio.create_task(
+        #     self.update_orders_task(OPEN_ORDERS_POLL_INTERVAL_SEC)
+        # )
 
         # WebSocket 1: Order book (uses self.exchange)
         if ENABLE_WEBSOCKET_OB:
@@ -1659,6 +1669,14 @@ class GLFTGridMarketMaker:
         if not self.is_warmup_complete():
             return
 
+        # ========== PERIODIC ORDER CACHE SYNC ==========
+        if t % ORDER_CACHE_SYNC_INTERVAL == 0 and t > 0:
+            print(f"[SYNC] Periodic order cache refresh...")
+            fresh_orders = await fetch_open_orders(self.exchange, self.symbol)
+            async with self._orders_lock:
+                self._open_orders = fresh_orders
+            print(f"[SYNC] ✓ Synced: {len(fresh_orders)} orders on exchange")
+
         try:
             # ========== GET MARKET DATA ==========
             best_bid, best_ask, bids, asks, ob_age = await self.get_cached_orderbook()
@@ -1996,6 +2014,14 @@ class GLFTGridMarketMaker:
             await self.mutate_cached_orders_add(placed_results)
 
             print(f"[ORDER_FLOW] ✓ Placed {len(placed_results)}/{len(new_orders_spec)} orders")
+
+            # Force refresh after placement to ensure cache is accurate
+            if len(placed_results) > 0:
+                await asyncio.sleep(POST_PLACEMENT_SYNC_DELAY_SEC)
+                fresh_orders = await fetch_open_orders(self.exchange, self.symbol)
+                async with self._orders_lock:
+                    self._open_orders = fresh_orders
+                print(f"[ORDER_FLOW] ✓ Cache refreshed: {len(fresh_orders)} orders")
         else:
             if VERBOSE_FAILURES and t % 10 == 0:
                 print(f"[ORDER_FLOW] No new orders to place")
